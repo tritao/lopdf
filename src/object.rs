@@ -843,7 +843,7 @@ impl Stream {
     /// for an unfiltered stream means bounding the raw content.
     fn plain_content(&self, limit: Option<usize>) -> Result<Vec<u8>> {
         match self.filters() {
-            Ok(filters) if !filters.is_empty() => self.decode_filters(limit),
+            Ok(filters) if !filters.is_empty() => self.decode_filters(limit, false),
             _ => {
                 reject_over_limit(self.content.len(), limit)?;
                 Ok(self.content.clone())
@@ -875,7 +875,7 @@ impl Stream {
     /// [`Stream::decompress_to_writer`], and load documents with
     /// [`crate::LoadOptions::max_decompressed_size`] set.
     pub fn decompressed_content(&self) -> Result<Vec<u8>> {
-        self.decode_filters(None)
+        self.decode_filters(None, false)
     }
 
     /// Decode this stream's content, rejecting the stream with
@@ -888,7 +888,23 @@ impl Stream {
     /// more than roughly `max_output` bytes per layer before being rejected,
     /// rather than expanding without limit.
     pub fn decompressed_content_with_limit(&self, max_output: usize) -> Result<Vec<u8>> {
-        self.decode_filters(Some(max_output))
+        self.decode_filters(Some(max_output), false)
+    }
+
+    /// Decode this stream's content like
+    /// [`Stream::decompressed_content_with_limit`], but treat damaged data as
+    /// an error instead of returning what could be decoded.
+    ///
+    /// The other decoding methods are lenient, which suits rendering: corrupt
+    /// or truncated Flate and LZW data yield their decodable prefix (often
+    /// nothing), and a missing ASCII85 or RunLength end-of-data marker is
+    /// accepted. When the content must be complete (an embedded file, XMP
+    /// metadata), use this method: each of those cases returns
+    /// [`Error::InvalidStream`]. One tolerance remains, as in the lenient path:
+    /// Flate data whose zlib checksum is wrong but which decodes completely as
+    /// raw deflate (seen in encrypted PDFs) is accepted.
+    pub fn decompressed_content_strict(&self, max_output: usize) -> Result<Vec<u8>> {
+        self.decode_filters(Some(max_output), true)
     }
 
     /// Decode this stream's content into a caller-provided writer, rejecting the
@@ -909,7 +925,9 @@ impl Stream {
     /// Shared decoder for [`Stream::decompressed_content`] and its bounded
     /// variants. `limit` is `None` to decode without a size limit, or
     /// `Some(max)` to cap the decoded output at `max` bytes per filter layer.
-    fn decode_filters(&self, limit: Option<usize>) -> Result<Vec<u8>> {
+    /// With `strict`, damaged data is an error (see
+    /// [`Stream::decompressed_content_strict`]).
+    fn decode_filters(&self, limit: Option<usize>, strict: bool) -> Result<Vec<u8>> {
         let decode_params = self.dict.get(b"DecodeParms").ok();
         let filters = match self.filters() {
             Ok(f) => f,
@@ -939,12 +957,12 @@ impl Stream {
                 _ => None,
             };
             output = match filter {
-                b"FlateDecode" | b"Fl" => Self::decompress_zlib(input, params, limit)?,
+                b"FlateDecode" | b"Fl" => Self::decompress_zlib(input, params, limit, strict)?,
                 b"BrotliDecode" => Self::decompress_brotli(input, limit)?,
-                b"LZWDecode" | b"LZW" => Self::decompress_lzw(input, params, limit)?,
-                b"ASCII85Decode" | b"A85" => Self::decode_ascii85(input, limit)?,
+                b"LZWDecode" | b"LZW" => Self::decompress_lzw(input, params, limit, strict)?,
+                b"ASCII85Decode" | b"A85" => Self::decode_ascii85(input, limit, strict)?,
                 b"ASCIIHexDecode" | b"AHx" => Self::decode_ascii_hex(input, limit)?,
-                b"RunLengthDecode" | b"RL" => Self::decode_run_length(input, limit)?,
+                b"RunLengthDecode" | b"RL" => Self::decode_run_length(input, limit, strict)?,
                 _ => return Err(Error::Unimplemented("decompression algorithms")),
             };
             reject_over_limit(output.len(), limit)?;
@@ -986,7 +1004,9 @@ impl Stream {
         }
     }
 
-    fn decompress_lzw(input: &[u8], params: Option<&Dictionary>, limit: Option<usize>) -> Result<Vec<u8>> {
+    fn decompress_lzw(
+        input: &[u8], params: Option<&Dictionary>, limit: Option<usize>, strict: bool,
+    ) -> Result<Vec<u8>> {
         use weezl::{BitOrder, decode::Decoder};
         const MIN_BITS: u8 = 9;
 
@@ -1002,12 +1022,22 @@ impl Stream {
             Decoder::new(BitOrder::Msb, MIN_BITS - 1)
         };
 
-        let output = Self::decompress_lzw_loop(input, &mut decoder, limit);
+        let (output, status) = Self::decompress_lzw_loop(input, &mut decoder, limit);
         reject_over_limit(output.len(), limit)?;
+        if let Err(err) = status {
+            if strict {
+                return Err(Error::InvalidStream(format!("LZW decoding failed: {err}")));
+            }
+            warn!("{err}");
+        }
         Self::decompress_predictor(output, params, limit)
     }
 
-    fn decompress_lzw_loop(input: &[u8], decoder: &mut weezl::decode::Decoder, limit: Option<usize>) -> Vec<u8> {
+    /// Decode `input`, returning the output and the decoder's final status
+    /// (an error leaves the output decoded so far).
+    fn decompress_lzw_loop(
+        input: &[u8], decoder: &mut weezl::decode::Decoder, limit: Option<usize>,
+    ) -> (Vec<u8>, std::io::Result<()>) {
         let mut output = vec![];
 
         // With a limit, decode through a writer that stops accepting bytes at `max + 1`, so a
@@ -1019,14 +1049,12 @@ impl Stream {
             }
             None => decoder.into_stream(&mut output).decode_all(input).status,
         };
-        if let Err(err) = status {
-            warn!("{err}");
-        }
-
-        output
+        (output, status)
     }
 
-    fn decompress_zlib(input: &[u8], params: Option<&Dictionary>, limit: Option<usize>) -> Result<Vec<u8>> {
+    fn decompress_zlib(
+        input: &[u8], params: Option<&Dictionary>, limit: Option<usize>, strict: bool,
+    ) -> Result<Vec<u8>> {
         use flate2::read::ZlibDecoder;
 
         // Reserve a starting capacity, but never pre-allocate beyond the limit so
@@ -1037,25 +1065,39 @@ impl Stream {
             && let Err(err) = Self::read_capped(ZlibDecoder::new(input), &mut output, limit)
         {
             warn!("{err}");
-            // Zlib failed (e.g. a corrupt adler32 in encrypted PDFs); retry as raw deflate.
-            if output.is_empty() && input.len() > 2 {
-                use flate2::read::DeflateDecoder;
-                if let Err(raw_err) = Self::read_capped(DeflateDecoder::new(&input[2..]), &mut output, limit) {
-                    warn!("raw deflate fallback also failed: {raw_err}");
+            use flate2::read::DeflateDecoder;
+            if strict {
+                // Only a complete raw-deflate decode (a bad adler32, e.g. in
+                // encrypted PDFs) is accepted; partial output is an error.
+                output.clear();
+                if input.len() <= 2 || Self::read_capped(DeflateDecoder::new(&input[2..]), &mut output, limit).is_err()
+                {
+                    return Err(Error::InvalidStream(format!(
+                        "Flate data is corrupt or truncated: {err}"
+                    )));
                 }
+            }
+            // Zlib failed (e.g. a corrupt adler32 in encrypted PDFs); retry as raw deflate.
+            else if output.is_empty()
+                && input.len() > 2
+                && let Err(raw_err) = Self::read_capped(DeflateDecoder::new(&input[2..]), &mut output, limit)
+            {
+                warn!("raw deflate fallback also failed: {raw_err}");
             }
         }
         reject_over_limit(output.len(), limit)?;
         Self::decompress_predictor(output, params, limit)
     }
 
-    fn decode_ascii85(input: &[u8], limit: Option<usize>) -> Result<Vec<u8>> {
+    fn decode_ascii85(input: &[u8], limit: Option<usize>, strict: bool) -> Result<Vec<u8>> {
         let mut output = vec![];
         let mut buffer: u32 = 0;
         let mut count = 0;
         // Check for EOD marker
         let input_no_eod = if input.len() >= 2 && &input[input.len() - 2..] == b"~>" {
             &input[..input.len() - 2]
+        } else if strict {
+            return Err(Error::InvalidStream("ASCII85 stream is missing its EOD marker".into()));
         } else {
             log::warn!("ASCII85 stream is missing its EOD marker");
             input
@@ -1141,26 +1183,45 @@ impl Stream {
     /// `0..=127` copies the next `l + 1` bytes literally, `129..=255` repeats the
     /// next byte `257 - l` times, and `128` marks the end of data. A stream that
     /// ends mid-run is decoded best-effort rather than treated as fatal.
-    fn decode_run_length(input: &[u8], limit: Option<usize>) -> Result<Vec<u8>> {
+    fn decode_run_length(input: &[u8], limit: Option<usize>, strict: bool) -> Result<Vec<u8>> {
+        let truncated = || Err(Error::InvalidStream("RunLength stream is truncated".into()));
         let mut output = vec![];
         let mut i = 0;
+        let mut eod = false;
         while i < input.len() {
             reject_over_limit(output.len(), limit)?;
             let length = input[i];
             i += 1;
             match length {
-                128 => break,
+                128 => {
+                    eod = true;
+                    break;
+                }
                 0..=127 => {
-                    let end = (i + length as usize + 1).min(input.len());
+                    let wanted = i + length as usize + 1;
+                    if strict && wanted > input.len() {
+                        return truncated();
+                    }
+                    let end = wanted.min(input.len());
                     output.extend_from_slice(&input[i..end]);
                     i = end;
                 }
                 _ => {
-                    let Some(&byte) = input.get(i) else { break };
+                    let Some(&byte) = input.get(i) else {
+                        if strict {
+                            return truncated();
+                        }
+                        break;
+                    };
                     output.resize(output.len() + (257 - length as usize), byte);
                     i += 1;
                 }
             }
+        }
+        if strict && !eod {
+            return Err(Error::InvalidStream(
+                "RunLength stream is missing its EOD marker".into(),
+            ));
         }
         Ok(output)
     }
@@ -1308,7 +1369,7 @@ impl Stream {
     /// counterpart: decode in place and drop the filter entries, so the stream
     /// keeps the decoded bytes under its own `/Length`.
     fn decompress_inner(&mut self, limit: Option<usize>) -> Result<()> {
-        let data = self.decode_filters(limit)?;
+        let data = self.decode_filters(limit, false)?;
         self.set_plain_content(data);
         Ok(())
     }
@@ -1332,7 +1393,7 @@ mod test {
             DId<j@<?3r@:F%a+D58'ATD4$Bl@l3De:,-DJs`8ARoFb/0JMK@qB4^F!,R<AKZ&-DfTqBG%G>u
             D.RTpAKYo'+CT/5+Cei#DII?(E,9)oF*2M7/c~>"#;
         let expected = "Man is distinguished, not only by his reason, but by this singular passion from other animals, which is a lust of the mind, that by a perseverance of delight in the continued and indefatigable generation of knowledge, exceeds the short vehemence of any carnal pleasure.";
-        let output = Stream::decode_ascii85(input.as_bytes(), None).unwrap();
+        let output = Stream::decode_ascii85(input.as_bytes(), None, false).unwrap();
         assert_eq!(&output, expected.as_bytes());
     }
 
@@ -1391,7 +1452,7 @@ mod test {
     #[test]
     fn test_decode_ascii85_overflow() {
         let input = b"uuuuu~>";
-        let output = Stream::decode_ascii85(input, None);
+        let output = Stream::decode_ascii85(input, None, false);
         // let expected: Result<Vec<u8>, Error> = Err(Error::ContentDecode);
         assert!(matches!(output, Err(Error::Decompress(DecompressError::Ascii85(_)))));
     }
@@ -1401,7 +1462,7 @@ mod test {
         // 85 * 50529027 == u32::MAX, so "s8W-" hits the multiply ceiling and the 5th digit
         // overflows the add; a multiply-only guard misses it. "s8W-!" is in range.
         assert_eq!(
-            Stream::decode_ascii85(b"s8W-!~>", None).unwrap(),
+            Stream::decode_ascii85(b"s8W-!~>", None, false).unwrap(),
             vec![255, 255, 255, 255]
         );
 
@@ -1410,7 +1471,7 @@ mod test {
             &b"s8W-~>"[..],   // same overflow via the partial-group padding
             &b"uuuuu~>"[..],  // overflow caught by the multiply
         ] {
-            let out = Stream::decode_ascii85(input, None);
+            let out = Stream::decode_ascii85(input, None, false);
             assert!(
                 matches!(out, Err(Error::Decompress(DecompressError::Ascii85(_)))),
                 "expected {input:?} to be rejected, got {out:?}"
@@ -1432,7 +1493,7 @@ mod test {
         ];
         for (input, expected) in cases {
             assert_eq!(
-                &Stream::decode_ascii85(input, None).unwrap(),
+                &Stream::decode_ascii85(input, None, false).unwrap(),
                 expected,
                 "input {input:?}"
             );
@@ -1592,7 +1653,7 @@ mod test {
         }
 
         // Normal zlib should fail, but our fallback should recover
-        let result = Stream::decompress_zlib(&compressed, None, None).unwrap();
+        let result = Stream::decompress_zlib(&compressed, None, None, false).unwrap();
         assert_eq!(result, original);
     }
 
@@ -1657,11 +1718,11 @@ mod test {
         let mut input = vec![b'z'; 1024 * 1024];
         input.extend_from_slice(b"~>");
 
-        let full = Stream::decode_ascii85(&input, None).unwrap();
+        let full = Stream::decode_ascii85(&input, None, false).unwrap();
         assert_eq!(full.len(), 4 * 1024 * 1024, "unbounded ASCII85 amplifies 4x");
 
         assert!(matches!(
-            Stream::decode_ascii85(&input, Some(1024 * 1024)),
+            Stream::decode_ascii85(&input, Some(1024 * 1024), false),
             Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) if limit == 1024 * 1024
         ));
     }
@@ -1749,7 +1810,7 @@ mod test {
         ];
         for (input, expected) in cases {
             assert_eq!(
-                &Stream::decode_run_length(input, None).unwrap(),
+                &Stream::decode_run_length(input, None, false).unwrap(),
                 expected,
                 "input {input:?}"
             );
@@ -1758,9 +1819,9 @@ mod test {
         // Run-length can amplify up to 128x, so an over-limit stream must be
         // rejected instead of allocating the full expansion (bomb guard).
         let bomb: Vec<u8> = std::iter::repeat_n([0x81u8, b'x'], 4096).flatten().collect();
-        assert_eq!(Stream::decode_run_length(&bomb, None).unwrap().len(), 128 * 4096);
+        assert_eq!(Stream::decode_run_length(&bomb, None, false).unwrap().len(), 128 * 4096);
         assert!(matches!(
-            Stream::decode_run_length(&bomb, Some(64 * 1024)),
+            Stream::decode_run_length(&bomb, Some(64 * 1024), false),
             Err(Error::Decompress(DecompressError::MemoryLimitExceeded { limit })) if limit == 64 * 1024
         ));
     }
@@ -1775,5 +1836,114 @@ mod test {
         assert!(matches!(dict.get(b"Missing"), Err(Error::DictKey(key)) if key == "Missing"));
         assert!(matches!(dict.get_mut(b"Present"), Ok(Object::Integer(1))));
         assert!(matches!(dict.get_mut(b"Missing"), Err(Error::DictKey(key)) if key == "Missing"));
+    }
+
+    /// A stream with the given filter over `content`.
+    fn filtered(filter: &str, content: Vec<u8>) -> Stream {
+        Stream::new(dictionary! { "Filter" => filter }, content)
+    }
+
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+        let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    const MAX: usize = 1 << 20;
+
+    #[test]
+    fn strict_rejects_corrupt_and_truncated_flate() {
+        let data = b"strict decoding of complete data ".repeat(40);
+        let good = zlib(&data);
+        assert_eq!(
+            filtered("FlateDecode", good.clone())
+                .decompressed_content_strict(MAX)
+                .unwrap(),
+            data
+        );
+
+        // Truncated: lenient gives a prefix, strict an error.
+        let truncated = filtered("FlateDecode", good[..good.len() / 2].to_vec());
+        let partial = truncated.decompressed_content_with_limit(MAX).unwrap();
+        assert!(partial.len() < data.len() && data.starts_with(&partial));
+        assert!(matches!(
+            truncated.decompressed_content_strict(MAX),
+            Err(Error::InvalidStream(_))
+        ));
+
+        // Not deflate at all: lenient gives nothing, strict an error.
+        let corrupt = filtered("FlateDecode", b"\x78\x9c not deflate data".to_vec());
+        assert_eq!(corrupt.decompressed_content_with_limit(MAX).unwrap(), b"");
+        assert!(matches!(
+            corrupt.decompressed_content_strict(MAX),
+            Err(Error::InvalidStream(_))
+        ));
+
+        // A wrong adler32 over complete deflate data is still accepted.
+        let mut bad_checksum = good;
+        let n = bad_checksum.len();
+        for b in &mut bad_checksum[n - 4..] {
+            *b ^= 0xFF;
+        }
+        assert_eq!(
+            filtered("FlateDecode", bad_checksum)
+                .decompressed_content_strict(MAX)
+                .unwrap(),
+            data
+        );
+
+        // The limit still applies.
+        let bomb = filtered("FlateDecode", zlib(&vec![0; 2 * MAX]));
+        assert!(matches!(
+            bomb.decompressed_content_strict(MAX),
+            Err(Error::Decompress(DecompressError::MemoryLimitExceeded { .. }))
+        ));
+    }
+
+    #[test]
+    fn strict_rejects_damaged_lzw_ascii85_and_run_length() {
+        // LZW: garbage (a code beyond the table).
+        let lzw = filtered("LZWDecode", vec![0xFF; 64]);
+        assert!(lzw.decompressed_content_with_limit(MAX).is_ok());
+        assert!(matches!(
+            lzw.decompressed_content_strict(MAX),
+            Err(Error::InvalidStream(_))
+        ));
+
+        // ASCII85 without its EOD marker.
+        assert_eq!(
+            filtered("ASCII85Decode", b"87cURD]i,\"Ebo80~>".to_vec())
+                .decompressed_content_strict(MAX)
+                .unwrap(),
+            b"Hello World!"
+        );
+        let no_eod = filtered("ASCII85Decode", b"87cURD]i,\"Ebo80".to_vec());
+        assert_eq!(no_eod.decompressed_content_with_limit(MAX).unwrap(), b"Hello World!");
+        assert!(matches!(
+            no_eod.decompressed_content_strict(MAX),
+            Err(Error::InvalidStream(_))
+        ));
+
+        // RunLength: complete, truncated literal, truncated run, no EOD.
+        assert_eq!(
+            filtered("RunLengthDecode", vec![2, b'a', b'b', b'c', 254, b'x', 128])
+                .decompressed_content_strict(MAX)
+                .unwrap(),
+            b"abcxxx"
+        );
+        for damaged in [
+            vec![5, b'a', b'b'],
+            vec![2, b'a', b'b', b'c', 254],
+            vec![2, b'a', b'b', b'c'],
+        ] {
+            let s = filtered("RunLengthDecode", damaged.clone());
+            assert!(s.decompressed_content_with_limit(MAX).is_ok(), "{damaged:?}");
+            assert!(
+                matches!(s.decompressed_content_strict(MAX), Err(Error::InvalidStream(_))),
+                "{damaged:?}"
+            );
+        }
     }
 }
